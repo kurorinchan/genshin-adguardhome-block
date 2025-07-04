@@ -94,6 +94,13 @@ def parse_arguments() -> argparse.Namespace:
         default=60,
         help="Timeout duration in seconds for monitoring the blocked query (default: 60)",
     )
+    parser.add_argument(
+        "--app",
+        type=str,
+        help="Path to an application to open after blocking (e.g., /Applications/Safari.app)",
+    )
+    # You could also make DOMAIN_TO_BLOCK an argument if you want
+    # parser.add_argument("--domain", default="dispatchosglobal.yuanshen.com", help="Domain to block/unblock")
 
     return parser.parse_args()
 
@@ -105,7 +112,7 @@ def verify_filter_status(
     adguard_api_url: str,
     domain: str,
     expected_reason: str,
-    timeout_delta: timedelta = VERIFICATION_TIMEOUT_DELTA,
+    timeout_delta: timedelta = VERIFICATION_TIMEOUT_DELTA,  # Changed to timedelta
 ) -> bool:
     """
     Polls the /control/filtering/check_host endpoint to verify the domain's filter status.
@@ -118,7 +125,9 @@ def verify_filter_status(
         f"      Verifying '{domain}' status is '{expected_reason}' (timeout: {timeout_delta.total_seconds()}s)..."
     )
 
-    while (datetime.now(timezone.utc) - start_time) < timeout_delta:
+    while (
+        datetime.now(timezone.utc) - start_time
+    ) < timeout_delta:  # Compare timedelta objects
         stdout, stderr, returncode = execute_curl(
             "GET", check_url_path, auth_header, content_type_header, adguard_api_url
         )
@@ -128,7 +137,7 @@ def verify_filter_status(
                 f"      Warning: Error checking host filter status. Curl exited with code {returncode}."
             )
             print(f"      Curl stderr: {stderr}")
-            time.sleep(POLLING_INTERVAL_DELTA.total_seconds())
+            time.sleep(POLLING_INTERVAL_DELTA.total_seconds())  # Use constant for sleep
             continue
 
         try:
@@ -151,7 +160,7 @@ def verify_filter_status(
         except Exception as e:
             print(f"      An unexpected error occurred during status verification: {e}")
 
-        time.sleep(POLLING_INTERVAL_DELTA.total_seconds())
+        time.sleep(POLLING_INTERVAL_DELTA.total_seconds())  # Use constant for sleep
 
     print(
         f"      Verification timed out for '{domain}'. Expected '{expected_reason}' but got '{current_reason if 'current_reason' in locals() else 'N/A'}'"
@@ -222,8 +231,10 @@ def block_domain(
             print(f"   Curl stdout: {stdout}")
             sys.exit(1)
 
+        # Removed JSON deserialization as an empty response is expected on success
         print(f"   Successfully sent BLOCK command for '{domain_to_block}'.")
 
+        # --- Verification Step ---
         if not verify_filter_status(
             auth_header,
             content_type_header,
@@ -296,13 +307,18 @@ def monitor_for_blocked_query(
             query_name: Optional[str] = query.get("question", {}).get(
                 "name"
             )  # Domain name is usually under 'question' -> 'name'
-            query_reason: Optional[str] = query.get("reason")
+            query_reason: Optional[str] = query.get(
+                "reason"
+            )  # Check for 'reason' field
 
+            # Ensure all necessary fields are present and reason is present for blocked status
             if not (query_time_str and query_name and query_reason):
                 continue
 
+            # Check if it's the correct domain AND the reason is 'FilteredBlackList'
             if query_name == domain_to_check and query_reason == "FilteredBlackList":
                 try:
+                    # Parse the ISO 8601 timestamp from AdGuard Home logs
                     query_dt: datetime = datetime.fromisoformat(
                         query_time_str.replace("Z", "+00:00")
                     )
@@ -319,6 +335,7 @@ def monitor_for_blocked_query(
                     print(
                         f"   Warning: Could not parse query time '{query_time_str}': {ve}"
                     )
+                    # Continue to next query if parsing fails
 
         return False  # No matching query found after checking all received queries
     except json.JSONDecodeError:
@@ -394,8 +411,10 @@ def unblock_domain(
             print(f"   Curl stdout: {stdout}")
             sys.exit(1)
 
+        # Removed JSON deserialization as an empty response is expected on success
         print(f"   Successfully sent UNBLOCK command for '{domain_to_block}'.")
 
+        # --- Verification Step ---
         if not verify_filter_status(
             auth_header,
             content_type_header,
@@ -452,6 +471,27 @@ def main() -> None:
     block_domain(
         AUTH_HEADER, CONTENT_TYPE_HEADER, ADGUARD_API_URL, DOMAIN_TO_BLOCK, BLOCK_RULE
     )
+
+    # --- Open application after successful blocking ---
+    if args.app:
+        print(f"   Opening application: {args.app}")
+        try:
+            # Use 'open' command for macOS to launch applications
+            subprocess.run(["open", args.app], check=True, capture_output=True)
+            print(f"   Successfully opened '{args.app}'.")
+        except FileNotFoundError:
+            print(
+                f"   Error: 'open' command not found. This script is intended for macOS."
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"   Error opening application '{args.app}': {e}")
+            print(f"   Stderr: {e.stderr.decode()}")
+        except Exception as e:
+            print(
+                f"   An unexpected error occurred while trying to open '{args.app}': {e}"
+            )
+    else:
+        print("   No application path provided. Skipping app launch.")
 
     # Record the start time for monitoring using datetime object
     start_monitoring_dt: datetime = datetime.now(timezone.utc)
