@@ -14,13 +14,6 @@ VERIFICATION_TIMEOUT_DELTA: timedelta = timedelta(seconds=60)
 # Sleep duration for polling loops (e.g., in verification and log monitoring)
 POLLING_INTERVAL_DELTA: timedelta = timedelta(seconds=5)
 
-# --- Configuration ---
-# The domain you want to block/unblock
-DOMAIN_TO_BLOCK: str = "dispatchosglobal.yuanshen.com"
-
-# AdGuard Home rule syntax for blocking a domain (hosts file style)
-BLOCK_RULE: str = f"0.0.0.0 {DOMAIN_TO_BLOCK}"
-
 
 # --- Helper function to execute curl commands ---
 def execute_curl(
@@ -88,6 +81,14 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--username", required=True, help="AdGuard Home username")
     parser.add_argument("--password", required=True, help="AdGuard Home password")
+
+    # REQUIRED: The domain logic you requested
+    parser.add_argument(
+        "--domain",
+        required=True,
+        help="The domain to block. This will also block all subdomains (e.g. 'example.com' blocks 'sub.example.com').",
+    )
+
     parser.add_argument(
         "--timeout",
         type=int,
@@ -99,8 +100,6 @@ def parse_arguments() -> argparse.Namespace:
         type=str,
         help="Path to an application to open after blocking (e.g., /Applications/Safari.app)",
     )
-    # You could also make DOMAIN_TO_BLOCK an argument if you want
-    # parser.add_argument("--domain", default="dispatchosglobal.yuanshen.com", help="Domain to block/unblock")
 
     return parser.parse_args()
 
@@ -112,22 +111,20 @@ def verify_filter_status(
     adguard_api_url: str,
     domain: str,
     expected_reason: str,
-    timeout_delta: timedelta = VERIFICATION_TIMEOUT_DELTA,  # Changed to timedelta
+    timeout_delta: timedelta = VERIFICATION_TIMEOUT_DELTA,
 ) -> bool:
     """
     Polls the /control/filtering/check_host endpoint to verify the domain's filter status.
     Returns True if the expected reason is found within the timeout, False otherwise.
     """
     check_url_path: str = f"filtering/check_host?name={domain}"
-    start_time: datetime = datetime.now(timezone.utc)  # Use datetime for start time
+    start_time: datetime = datetime.now(timezone.utc)
 
     print(
         f"      Verifying '{domain}' status is '{expected_reason}' (timeout: {timeout_delta.total_seconds()}s)..."
     )
 
-    while (
-        datetime.now(timezone.utc) - start_time
-    ) < timeout_delta:  # Compare timedelta objects
+    while (datetime.now(timezone.utc) - start_time) < timeout_delta:
         stdout, stderr, returncode = execute_curl(
             "GET", check_url_path, auth_header, content_type_header, adguard_api_url
         )
@@ -137,7 +134,7 @@ def verify_filter_status(
                 f"      Warning: Error checking host filter status. Curl exited with code {returncode}."
             )
             print(f"      Curl stderr: {stderr}")
-            time.sleep(POLLING_INTERVAL_DELTA.total_seconds())  # Use constant for sleep
+            time.sleep(POLLING_INTERVAL_DELTA.total_seconds())
             continue
 
         try:
@@ -160,7 +157,7 @@ def verify_filter_status(
         except Exception as e:
             print(f"      An unexpected error occurred during status verification: {e}")
 
-        time.sleep(POLLING_INTERVAL_DELTA.total_seconds())  # Use constant for sleep
+        time.sleep(POLLING_INTERVAL_DELTA.total_seconds())
 
     print(
         f"      Verification timed out for '{domain}'. Expected '{expected_reason}' but got '{current_reason if 'current_reason' in locals() else 'N/A'}'"
@@ -179,7 +176,9 @@ def block_domain(
     """
     Blocks access to the specified domain in AdGuard Home and verifies the change.
     """
-    print(f"1. Attempting to BLOCK access to '{domain_to_block}'...")
+    print(
+        f"1. Attempting to BLOCK access to '{domain_to_block}' (Rule: {block_rule})..."
+    )
     try:
         # Fetch current custom filtering rules
         print("   Fetching current filtering rules...")
@@ -231,7 +230,6 @@ def block_domain(
             print(f"   Curl stdout: {stdout}")
             sys.exit(1)
 
-        # Removed JSON deserialization as an empty response is expected on success
         print(f"   Successfully sent BLOCK command for '{domain_to_block}'.")
 
         # --- Verification Step ---
@@ -265,11 +263,12 @@ def monitor_for_blocked_query(
     """
     Checks query logs for a blocked query to the specified domain
     since the given start_datetime_utc. Returns True if found, False otherwise.
-    This function performs a single check, not a loop.
+
+    UPDATED LOGIC: checks if the query ends with the domain (subdomain match).
     """
     # Construct query parameters for the API call
     params: Dict[str, Any] = {
-        "search": domain_to_check,
+        "search": domain_to_check,  # AdGuard API performs a substring search here
         "limit": 50,  # Fetch a reasonable number of recent queries
     }
 
@@ -277,9 +276,8 @@ def monitor_for_blocked_query(
     query_string: str = "&".join([f"{k}={v}" for k, v in params.items()])
     full_path_with_query: str = f"querylog?{query_string}"
 
-    print(
-        f"   Querying logs with: {full_path_with_query}"
-    )  # Debugging: show the exact query URL
+    # Debugging: show the exact query URL
+    # print(f"   Querying logs with: {full_path_with_query}")
 
     stdout, stderr, returncode = execute_curl(
         "GET", full_path_with_query, auth_header, content_type_header, adguard_api_url
@@ -294,29 +292,27 @@ def monitor_for_blocked_query(
 
     try:
         log_data: Dict[str, Any] = json.loads(stdout)
-        queries: list[Dict[str, Any]] = log_data.get(
-            "data", []
-        )  # Query logs are usually in a 'data' key
+        queries: list[Dict[str, Any]] = log_data.get("data", [])
 
-        print(f"   Received {len(queries)} queries from API. Checking for match...")
         if not queries:
             return False
 
         for query in queries:
             query_time_str: Optional[str] = query.get("time")
-            query_name: Optional[str] = query.get("question", {}).get(
-                "name"
-            )  # Domain name is usually under 'question' -> 'name'
-            query_reason: Optional[str] = query.get(
-                "reason"
-            )  # Check for 'reason' field
+            query_name: Optional[str] = query.get("question", {}).get("name")
+            query_reason: Optional[str] = query.get("reason")
 
-            # Ensure all necessary fields are present and reason is present for blocked status
+            # Ensure all necessary fields are present
             if not (query_time_str and query_name and query_reason):
                 continue
 
-            # Check if it's the correct domain AND the reason is 'FilteredBlackList'
-            if query_name == domain_to_check and query_reason == "FilteredBlackList":
+            # LOGIC UPDATE: Check if it's the domain OR a subdomain
+            # e.g. domain_to_check="zenless.net" matches "global.zenless.net"
+            is_match = (query_name == domain_to_check) or query_name.endswith(
+                f".{domain_to_check}"
+            )
+
+            if is_match and query_reason == "FilteredBlackList":
                 try:
                     # Parse the ISO 8601 timestamp from AdGuard Home logs
                     query_dt: datetime = datetime.fromisoformat(
@@ -335,9 +331,8 @@ def monitor_for_blocked_query(
                     print(
                         f"   Warning: Could not parse query time '{query_time_str}': {ve}"
                     )
-                    # Continue to next query if parsing fails
 
-        return False  # No matching query found after checking all received queries
+        return False  # No matching query found
     except json.JSONDecodeError:
         print(f"   Warning: Error parsing query log JSON: {stdout}")
         return False
@@ -411,7 +406,6 @@ def unblock_domain(
             print(f"   Curl stdout: {stdout}")
             sys.exit(1)
 
-        # Removed JSON deserialization as an empty response is expected on success
         print(f"   Successfully sent UNBLOCK command for '{domain_to_block}'.")
 
         # --- Verification Step ---
@@ -445,6 +439,12 @@ def main() -> None:
     adguard_home_port: int = args.port
     username: str = args.username
     password: str = args.password
+    domain_to_block: str = args.domain  # Captured from CLI
+
+    # --- Rule Configuration ---
+    # We use AdBlock syntax "||example.com^" instead of Hosts syntax "0.0.0.0 example.com"
+    # This allows blocking the parent domain to automatically block all subdomains.
+    block_rule: str = f"||{domain_to_block}^"
 
     # Convert timeout_seconds (int) to timeout_delta (timedelta)
     timeout_delta: timedelta = timedelta(seconds=args.timeout)
@@ -463,13 +463,14 @@ def main() -> None:
 
     print("--- AdGuard Home Domain Blocker/Unblocker ---")
     print(f"Target AdGuard Home: {ADGUARD_API_URL}")
-    print(f"Domain to manage: {DOMAIN_TO_BLOCK}")
+    print(f"Domain to manage: {domain_to_block}")
+    print(f"Applied Rule: {block_rule}")
     print(f"Monitoring timeout: {timeout_delta.total_seconds()} seconds")
     print("")
 
     # 2. Execute steps
     block_domain(
-        AUTH_HEADER, CONTENT_TYPE_HEADER, ADGUARD_API_URL, DOMAIN_TO_BLOCK, BLOCK_RULE
+        AUTH_HEADER, CONTENT_TYPE_HEADER, ADGUARD_API_URL, domain_to_block, block_rule
     )
 
     # --- Open application after successful blocking ---
@@ -498,7 +499,7 @@ def main() -> None:
     blocked_query_found: bool = False
 
     # Monitor logs until the blocked query is found or timeout occurs
-    print(f"2. Monitoring query logs for a blocked query to '{DOMAIN_TO_BLOCK}'...")
+    print(f"2. Monitoring query logs for a blocked query to '{domain_to_block}'...")
     while (datetime.now(timezone.utc) - start_monitoring_dt) < timeout_delta:
         # Pass the datetime object directly to the function
         found_blocked_this_check: bool = monitor_for_blocked_query(
@@ -506,11 +507,13 @@ def main() -> None:
             CONTENT_TYPE_HEADER,
             ADGUARD_API_URL,
             start_monitoring_dt,
-            DOMAIN_TO_BLOCK,
+            domain_to_block,
         )
         if found_blocked_this_check:
             blocked_query_found = True
-            print(f"   Detected a BLOCK for '{DOMAIN_TO_BLOCK}' in query logs.")
+            print(
+                f"   Detected a BLOCK for '{domain_to_block}' (or subdomain) in query logs."
+            )
             break
         else:
             elapsed_time_dt: timedelta = (
@@ -521,18 +524,18 @@ def main() -> None:
                 0, int(timeout_delta.total_seconds() - elapsed_time_dt.total_seconds())
             )
             print(
-                f"   '{DOMAIN_TO_BLOCK}' not yet found as BLOCKED in logs. Retrying in {POLLING_INTERVAL_DELTA.total_seconds()} second(s). ({remaining_time}s remaining)"
+                f"   '{domain_to_block}' not yet found as BLOCKED in logs. Retrying in {POLLING_INTERVAL_DELTA.total_seconds()} second(s). ({remaining_time}s remaining)"
             )
             time.sleep(POLLING_INTERVAL_DELTA.total_seconds())
 
     if not blocked_query_found:
         print(
-            f"   Timeout reached ({timeout_delta.total_seconds()} seconds). No blocked query for '{DOMAIN_TO_BLOCK}' detected."
+            f"   Timeout reached ({timeout_delta.total_seconds()} seconds). No blocked query for '{domain_to_block}' detected."
         )
 
     # Always proceed to unblock the domain after monitoring (whether found or timed out)
     unblock_domain(
-        AUTH_HEADER, CONTENT_TYPE_HEADER, ADGUARD_API_URL, DOMAIN_TO_BLOCK, BLOCK_RULE
+        AUTH_HEADER, CONTENT_TYPE_HEADER, ADGUARD_API_URL, domain_to_block, block_rule
     )
 
     print("--- Script finished. ---")
