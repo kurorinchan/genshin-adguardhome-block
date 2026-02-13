@@ -478,7 +478,7 @@ def main() -> None:
         print(f"   Opening application: {args.app}")
         try:
             # Use 'open' command for macOS to launch applications
-            subprocess.run(["open", args.app], check=True, capture_output=True)
+            subprocess.run(["open", "-n", args.app], check=True, capture_output=True)
             print(f"   Successfully opened '{args.app}'.")
         except FileNotFoundError:
             print(
